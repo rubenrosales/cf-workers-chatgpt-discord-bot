@@ -1,188 +1,199 @@
-import {OpenAI} from "./openai"
-import {Cloudflare} from "./cloudflare"
+import { Cloudflare } from "./cloudflare";
 import { InteractionResponseFlags, InteractionResponseType, InteractionType, verifyKey } from "discord-interactions";
 import { Discord } from "./discord";
 import { DISCORD_COMMANDS } from "./commands";
 
+// Assuming you have a Gemini API wrapper in "./gemini"
+import { Gemini } from "./gemini";
+
 export interface Env {
-	CHATGPT_DISCORD_BOT_KV: KVNamespace
-	DISCORD_PUBLIC_KEY: string
-	DISCORD_APPLICATION_ID: string
-	DISCORD_TOKEN: string
-	DISCORD_USERID_WHITELIST: string
-	OPENAI_API_KEY: string
-	CHATGPT_MODEL: string
-	CHATGPT_BEHAVIOR: string
-	CONTEXT: number
+    CHATGPT_DISCORD_BOT_KV: KVNamespace;
+    DISCORD_PUBLIC_KEY: string;
+    DISCORD_APPLICATION_ID: string;
+    DISCORD_TOKEN: string;
+    DISCORD_USERID_WHITELIST: string;
+    GEMINI_API_KEY: string; // Changed from OPENAI_API_KEY
+    GEMINI_MODEL: string; // Changed from CHATGPT_MODEL
+    CHATGPT_BEHAVIOR: string; // Consider renaming if not directly applicable
+    CONTEXT: number;
 }
 
 export default {
-	async fetch(
-		request: Request,
-		env: Env,
-		ctx: ExecutionContext,
-	): Promise<Response> {
-		// verify request came from Discord
-		const signature = request.headers.get('x-signature-ed25519');
-		const timestamp = request.headers.get('x-signature-timestamp');
-		if (!signature || !timestamp) {
-			return Discord.generateResponse({
-				error: "Unauthorized"
-			}, {
-				status: 401,
-			})
-		}
-		const body = await request.clone().arrayBuffer();
-		const isValidRequest = verifyKey(
-			body,
-			signature,
-			timestamp,
-			env.DISCORD_PUBLIC_KEY
-		);
-		if (!isValidRequest) {
-			return Discord.generateResponse({
-				error: "Unauthorized"
-			}, {
-				status: 401,
-			})
-		}
+    async fetch(
+        request: Request,
+        env: Env,
+        ctx: ExecutionContext,
+    ): Promise<Response> {
+        // verify request came from Discord
+        const signature = request.headers.get('x-signature-ed25519');
+        const timestamp = request.headers.get('x-signature-timestamp');
+		
+        if (!signature || !timestamp) {
+            return Discord.generateResponse({
+                error: "Unauthorized"
+            }, {
+                status: 401,
+            })
+        }
+		const body = await request.clone().text(); // Use .text() instead of .arrayBuffer()
+		const interactionData = JSON.parse(body); // Parse the JSON string
 
-		const message: Discord.Interaction = await request.json()
+		// Now you have the interaction data in interactionData
+		console.log(interactionData); // Example: Log the data
 
-		const chatId: string = message.channel_id || message.user?.id || "-1"
+        // const body = await request.clone().arrayBuffer();
+        const isValidRequest = verifyKey(
+            body,
+            signature,
+            timestamp,
+            env.DISCORD_PUBLIC_KEY
+        );
 
-		// user is not in whitelist
-		const userId: string = message.member?.user?.id || message.user?.id || "-1"
-		if (env.DISCORD_USERID_WHITELIST && !env.DISCORD_USERID_WHITELIST.split(" ").includes(userId)) {
-			return Discord.generateResponse({
-				error: "Unauthorized"
-			}, {
-				status: 401,
-			})
-		}
+        console.log( env.DISCORD_PUBLIC_KEY)
+        if (!isValidRequest) {
+            return Discord.generateResponse({
+                error: "Unauthorized"
+            }, {
+                status: 401,
+            })
+        }
 
-		if (message.type === InteractionType.PING) {
-			return Discord.generateResponse({
-				type: InteractionResponseType.PONG,
-			})
-		}
+        const message: Discord.Interaction = await request.json()
 
-		if (message.type === InteractionType.APPLICATION_COMMAND) {
-			switch (message.data.name.toLowerCase()) {
-				case DISCORD_COMMANDS.CHATGPT_COMMAND.name.toLowerCase(): {
-					const context = await _getContext(env, chatId)
+        const chatId: string = message.channel_id || message.user?.id || "-1"
 
-					// join all arguments
-					const query = message.data.options?.map((option) => option.value).join(" ") || ""
-					if (query.trim() == "") {
-						return Discord.generateResponse({
-							type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
-							data: {
-								content: "Please provide a query",
-								flags: InteractionResponseFlags.EPHEMERAL,
-							}
-						})
-					}
+        // user is not in whitelist
+        const userId: string = message.member?.user?.id || message.user?.id || "-1"
+        // if (env.DISCORD_USERID_WHITELIST && !env.DISCORD_USERID_WHITELIST.split(" ").includes(userId)) {
+        //     return Discord.generateResponse({
+        //         error: "Unauthorized"
+        //     }, {
+        //         status: 401,
+        //     })
+        // }
 
-					// prepare context
-					context.push({"role": "user", "content": query})
+        if (message.type === InteractionType.PING) {
+            return Discord.generateResponse({
+                type: InteractionResponseType.PONG,
+            })
+        }
 
-					// send response to Discord once ready
-					ctx.waitUntil(new Promise(async _ => {
-						// query OpenAPI with context
-						const content = await OpenAI.complete(env.OPENAI_API_KEY, env.CHATGPT_MODEL, env.CHATGPT_BEHAVIOR, `dc_${userId}`, context)
+        if (message.type === InteractionType.APPLICATION_COMMAND) {
+            switch (message.data.name.toLowerCase()) {
+                case DISCORD_COMMANDS.CHATGPT_COMMAND.name.toLowerCase(): {
+                    const context = await _getContext(env, chatId)
 
-						// add reply to context
-						if (env.CONTEXT && env.CONTEXT > 0 && env.CHATGPT_DISCORD_BOT_KV) {
-							context.push({"role": "assistant", "content": content})
-							await Cloudflare.putKVChatContext(env.CHATGPT_DISCORD_BOT_KV, chatId, context)
-						}
+                    // join all arguments
+                    const query = message.data.options?.map((option) => option.value).join(" ") || ""
+                    if (query.trim() == "") {
+                        return Discord.generateResponse({
+                            type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
+                            data: {
+                                content: "Please provide a query",
+                                flags: InteractionResponseFlags.EPHEMERAL,
+                            }
+                        })
+                    }
 
-						await fetch(`https://discord.com/api/v10/webhooks/${env.DISCORD_APPLICATION_ID}/${message.token}/messages/@original`, {
-							method: "PATCH",
-							headers: {
-								"Content-Type": "application/json;charset=UTF-8",
-							},
-							body: JSON.stringify({
-								content: `> ${query}`,
-								embeds: [{description: content}]
-							})
-						})
-					}))
+                    // prepare context
+                    context.push({"role": "user", "content": query})
 
-					// immediately respond an acknowledgement first
-					return Discord.generateResponse({
-						type: InteractionResponseType.DEFERRED_CHANNEL_MESSAGE_WITH_SOURCE,
-					})
-				}
-				case DISCORD_COMMANDS.CONTEXT_COMMAND.name.toLowerCase(): {
-					const context = await _getContext(env, chatId)
+                    // send response to Discord once ready
+                    ctx.waitUntil(new Promise(async _ => {
+                        // query Gemini with context
+                        const content = await Gemini.complete(env.GEMINI_API_KEY, env.GEMINI_MODEL, env.CHATGPT_BEHAVIOR, `dc_${userId}`, context)
 
-					if (context.length > 0) {
-						return Discord.generateResponse({
-							type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
-							data: {
-								content: "```json\n"+JSON.stringify(context)+"\n```",
-							}
-						})
-					}
-					return Discord.generateResponse({
-						type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
-						data: {
-							content: "Context is empty or not available.",
-							flags: InteractionResponseFlags.EPHEMERAL
-						}
-					})
-				}
-				case DISCORD_COMMANDS.CLEAR_COMMAND.name.toLowerCase(): {
-					if (env.CONTEXT && env.CONTEXT > 0 && env.CHATGPT_DISCORD_BOT_KV) {
-						await Cloudflare.putKVChatContext(env.CHATGPT_DISCORD_BOT_KV, chatId, [])
-					}
-					return Discord.generateResponse({
-						type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
-						data: {
-							content: "Context for the current chat (if it existed) has been cleared.",
-							flags: InteractionResponseFlags.EPHEMERAL
-						}
-					})
-				}
-				case DISCORD_COMMANDS.INVITE_COMMAND.name.toLowerCase(): {
-					const INVITE_URL = `https://discord.com/oauth2/authorize?client_id=${env.DISCORD_APPLICATION_ID}&permissions=2147485696&scope=bot`;
-					return Discord.generateResponse({
-						type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
-						data: {
-							content: INVITE_URL,
-							flags: InteractionResponseFlags.EPHEMERAL
-						}
-					})
-				}
-				default: {
-					return Discord.generateResponse({
-						error: "Unknown command"
-					}, {
-						status: 400,
-					})
-				}
-			}
-		}
+                        // add reply to context
+                        if (env.CONTEXT && env.CONTEXT > 0 && env.CHATGPT_DISCORD_BOT_KV) {
+                            context.push({"role": "assistant", "content": content})
+                            await Cloudflare.putKVChatContext(env.CHATGPT_DISCORD_BOT_KV, chatId, context)
+                        }
 
-		return Discord.generateResponse({
-			error: "Unexpected error"
-		}, {
-			status: 500,
-		})
-	}
+                        await fetch(`https://discord.com/api/v10/webhooks/${env.DISCORD_APPLICATION_ID}/${message.token}/messages/@original`, {
+                            method: "PATCH",
+                            headers: {
+                                "Content-Type": "application/json;charset=UTF-8",
+                            },
+                            body: JSON.stringify({
+                                content: `> ${query}`,
+                                embeds: [{description: content}]
+                            })
+                        })
+                    }))
+
+                    // immediately respond an acknowledgement first
+                    return Discord.generateResponse({
+                        type: InteractionResponseType.DEFERRED_CHANNEL_MESSAGE_WITH_SOURCE,
+                    })
+                }
+                case DISCORD_COMMANDS.CONTEXT_COMMAND.name.toLowerCase(): {
+                    const context = await _getContext(env, chatId)
+
+                    if (context.length > 0) {
+                        return Discord.generateResponse({
+                            type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
+                            data: {
+                                content: "```json\n"+JSON.stringify(context)+"\n```",
+                            }
+                        })
+                    }
+                    return Discord.generateResponse({
+                        type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
+                        data: {
+                            content: "Context is empty or not available.",
+                            flags: InteractionResponseFlags.EPHEMERAL
+                        }
+                    })
+                }
+                case DISCORD_COMMANDS.CLEAR_COMMAND.name.toLowerCase(): {
+                    if (env.CONTEXT && env.CONTEXT > 0 && env.CHATGPT_DISCORD_BOT_KV) {
+                        await Cloudflare.putKVChatContext(env.CHATGPT_DISCORD_BOT_KV, chatId, [])
+                    }
+                    return Discord.generateResponse({
+                        type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
+                        data: {
+                            content: "Context for the current chat (if it existed) has been cleared.",
+                            flags: InteractionResponseFlags.EPHEMERAL
+                        }
+                    })
+                }
+                case DISCORD_COMMANDS.INVITE_COMMAND.name.toLowerCase(): {
+                    const INVITE_URL = `https://discord.com/oauth2/authorize?client_id=${env.DISCORD_APPLICATION_ID}&permissions=2147485696&scope=bot`;
+                    return Discord.generateResponse({
+                        type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
+                        data: {
+                            content: INVITE_URL,
+                            flags: InteractionResponseFlags.EPHEMERAL
+                        }
+                    })
+                }
+                default: {
+                    return Discord.generateResponse({
+                        error: "Unknown command"
+                    }, {
+                        status: 400,
+                    })
+                }
+            }
+        }
+
+        return Discord.generateResponse({
+            error: "Unexpected error"
+        }, {
+            status: 500,
+        })
+    }
 }
 
-async function _getContext(env: Env, chatId: string): Promise<OpenAI.Message[]> {
-	// retrieve current context
-	let context: OpenAI.Message[] = []
-	if (env.CONTEXT && env.CONTEXT > 0 && env.CHATGPT_DISCORD_BOT_KV) {
-		context = await Cloudflare.getKVChatContext(env.CHATGPT_DISCORD_BOT_KV, chatId)
-	}
-	// truncate context to a maximum of (env.CONTEXT * 2)
-	while (context.length > Math.max(1, env.CONTEXT * 2)) {
-		context.shift()
-	}
-	return context
+async function _getContext(env: Env, chatId: string): Promise<Gemini.Message[]> {
+    // retrieve current context
+    let context: Gemini.Message[] = []
+    if (env.CONTEXT && env.CONTEXT > 0 && env.CHATGPT_DISCORD_BOT_KV) {
+        context = await Cloudflare.getKVChatContext(env.CHATGPT_DISCORD_BOT_KV, chatId) as Gemini.Message[];
+    }
+    // truncate context to a maximum of (env.CONTEXT * 2)
+    while (context.length > Math.max(1, env.CONTEXT * 2)) {
+        context.shift()
+    }
+    return context
 }
